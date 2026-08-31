@@ -161,7 +161,7 @@ def razorpay_request(method, endpoint, payload=None):
 @app.route("/")
 def home():
     return send_from_directory(
-        os.path.expanduser("~"),
+        os.path.dirname(os.path.abspath(__file__)),
         "index.html"
     )
 
@@ -629,7 +629,7 @@ if __name__ == "__main__":
     )
 
     app.run(
-        host="127.0.0.1",
-        port=5000,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
         debug=False
     )
