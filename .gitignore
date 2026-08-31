@@ -1,0 +1,5 @@
+users.db
+*.db
+.env
+*.secret
+__pycache__/
