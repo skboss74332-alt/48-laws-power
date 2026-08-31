@@ -1,635 +1,153 @@
+import os, json, sqlite3, base64, hashlib, hmac, urllib.request
+from functools import wraps
 from flask import Flask, request, jsonify, session, send_from_directory
-import sqlite3
 from werkzeug.security import generate_password_hash, check_password_hash
-import os
-import json
-import base64
-import urllib.request
-import urllib.error
-import hmac
-import hashlib
+from laws_data import LAWS
 
-app = Flask(__name__)
-app.secret_key = os.environ.get(
-    "FLASK_SECRET_KEY",
-    "change-this-secret-key"
-)
-
-DB = os.path.expanduser("~/users.db")
-
-# ₹49 = 4900 paise
-PRICE = int(os.environ.get("PREMIUM_PRICE_PAISE", "4900"))
-
-RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
-
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-
-
-# ==================================================
-# DATABASE
-# ==================================================
+app=Flask(__name__,static_folder=".",static_url_path="")
+app.secret_key=os.environ.get("FLASK_SECRET_KEY","")
+if not app.secret_key: raise RuntimeError("FLASK_SECRET_KEY set karo")
+DB=os.environ.get("DB_PATH","users.db")
+PRICE=int(os.environ.get("PREMIUM_PRICE_PAISE","9900"))
+RP_ID=os.environ.get("RAZORPAY_KEY_ID","")
+RP_SECRET=os.environ.get("RAZORPAY_KEY_SECRET","")
+WEBHOOK_SECRET=os.environ.get("RAZORPAY_WEBHOOK_SECRET","")
+app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",
+                  SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE","0")=="1")
 
 def db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 
 def init_db():
-    conn = db()
+    c=db()
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,paid INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS orders(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+      razorpay_order_id TEXT UNIQUE NOT NULL,amount INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'INR',status TEXT NOT NULL DEFAULT 'created',
+      razorpay_payment_id TEXT UNIQUE,razorpay_signature TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    c.commit(); c.close()
 
-    # Existing users table থাকলে paid column add হবে
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            paid INTEGER DEFAULT 0
-        )
-    """)
+def current_user():
+    uid=session.get("user_id")
+    if not uid:return None
+    c=db(); u=c.execute("SELECT id,name,email,paid FROM users WHERE id=?",(uid,)).fetchone(); c.close()
+    if not u: session.clear()
+    return u
 
-    # Old users.db হলে paid column না থাকলে add করার চেষ্টা
-    columns = [
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(users)").fetchall()
-    ]
+def login_required(fn):
+    @wraps(fn)
+    def w(*a,**k):
+        if not current_user():return jsonify(success=False,message="Login required"),401
+        return fn(*a,**k)
+    return w
 
-    if "paid" not in columns:
-        conn.execute(
-            "ALTER TABLE users ADD COLUMN paid INTEGER DEFAULT 0"
-        )
+def rp(method,path,payload=None):
+    if not RP_ID or not RP_SECRET: raise RuntimeError("Razorpay keys missing")
+    token=base64.b64encode(f"{RP_ID}:{RP_SECRET}".encode()).decode()
+    body=None if payload is None else json.dumps(payload).encode()
+    r=urllib.request.Request("https://api.razorpay.com/v1"+path,data=body,method=method)
+    r.add_header("Authorization","Basic "+token);r.add_header("Content-Type","application/json")
+    with urllib.request.urlopen(r,timeout=20) as x:return json.loads(x.read().decode())
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            razorpay_order_id TEXT UNIQUE NOT NULL,
-            amount INTEGER NOT NULL,
-            currency TEXT NOT NULL DEFAULT 'INR',
-            status TEXT NOT NULL DEFAULT 'created',
-            razorpay_payment_id TEXT UNIQUE,
-            razorpay_signature TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+@app.get("/")
+def home():return send_from_directory(".","index.html")
 
-    conn.commit()
-    conn.close()
-
-
-# ==================================================
-# CURRENT USER
-# ==================================================
-
-def get_current_user():
-    user_id = session.get("user_id")
-
-    if not user_id:
-        return None
-
-    conn = db()
-
-    user = conn.execute(
-        """
-        SELECT id, name, email, paid
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,)
-    ).fetchone()
-
-    conn.close()
-
-    if not user:
-        session.clear()
-        return None
-
-    return user
-
-
-# ==================================================
-# RAZORPAY API
-# ==================================================
-
-def razorpay_request(method, endpoint, payload=None):
-
-    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-        raise RuntimeError(
-            "RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET missing"
-        )
-
-    auth = base64.b64encode(
-        f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode()
-    ).decode()
-
-    url = "https://api.razorpay.com/v1" + endpoint
-
-    data = None
-
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method
-    )
-
-    req.add_header(
-        "Authorization",
-        "Basic " + auth
-    )
-
-    req.add_header(
-        "Content-Type",
-        "application/json"
-    )
-
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(
-            response.read().decode("utf-8")
-        )
-
-
-# ==================================================
-# HOME
-# ==================================================
-
-@app.route("/")
-def home():
-    return send_from_directory(
-        os.path.dirname(os.path.abspath(__file__)),
-        "index.html"
-    )
-
-
-# ==================================================
-# REGISTER
-# ==================================================
-
-@app.route("/register", methods=["POST"])
+@app.post("/api/register")
 def register():
+    d=request.get_json(silent=True) or {}; name=str(d.get("name","")).strip()
+    email=str(d.get("email","")).strip().lower(); pw=str(d.get("password",""))
+    if not name or not email or not pw:return jsonify(success=False,message="Sabhi fields bharo"),400
+    if len(pw)<6:return jsonify(success=False,message="Password kam se kam 6 characters ka hona chahiye"),400
+    c=db()
+    try:c.execute("INSERT INTO users(name,email,password) VALUES(?,?,?)",(name,email,generate_password_hash(pw)));c.commit()
+    except sqlite3.IntegrityError:c.close();return jsonify(success=False,message="Ye email already registered hai"),409
+    c.close();return jsonify(success=True,message="Registration successful")
 
-    data = request.get_json(silent=True) or {}
-
-    name = str(
-        data.get("name", "")
-    ).strip()
-
-    email = str(
-        data.get("email", "")
-    ).strip().lower()
-
-    password = str(
-        data.get("password", "")
-    )
-
-    if not name or not email or not password:
-        return jsonify(
-            success=False,
-            message="সবগুলো ঘর পূরণ করুন।"
-        ), 400
-
-    if len(password) < 6:
-        return jsonify(
-            success=False,
-            message="Password কমপক্ষে 6 characters হতে হবে।"
-        ), 400
-
-    conn = db()
-
-    try:
-
-        conn.execute(
-            """
-            INSERT INTO users
-            (name, email, password, paid)
-            VALUES (?, ?, ?, 0)
-            """,
-            (
-                name,
-                email,
-                generate_password_hash(password)
-            )
-        )
-
-        conn.commit()
-
-    except sqlite3.IntegrityError:
-
-        conn.close()
-
-        return jsonify(
-            success=False,
-            message="এই Email দিয়ে আগে থেকেই account আছে।"
-        ), 409
-
-    conn.close()
-
-    return jsonify(
-        success=True,
-        message="Registration successful!"
-    )
-
-
-# ==================================================
-# LOGIN
-# ==================================================
-
-@app.route("/login", methods=["POST"])
+@app.post("/api/login")
 def login():
+    d=request.get_json(silent=True) or {};email=str(d.get("email","")).strip().lower();pw=str(d.get("password",""))
+    c=db();u=c.execute("SELECT * FROM users WHERE email=?",(email,)).fetchone();c.close()
+    if not u or not check_password_hash(u["password"],pw):return jsonify(success=False,message="Email ya password galat hai"),401
+    session.clear();session["user_id"]=u["id"]
+    return jsonify(success=True,message="Login successful",user={"name":u["name"],"email":u["email"],"paid":bool(u["paid"])})
 
-    data = request.get_json(silent=True) or {}
-
-    email = str(
-        data.get("email", "")
-    ).strip().lower()
-
-    password = str(
-        data.get("password", "")
-    )
-
-    conn = db()
-
-    user = conn.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE email = ?
-        """,
-        (email,)
-    ).fetchone()
-
-    conn.close()
-
-    if (
-        not user
-        or not check_password_hash(
-            user["password"],
-            password
-        )
-    ):
-
-        return jsonify(
-            success=False,
-            message="Email অথবা Password ভুল।"
-        ), 401
-
-    session.clear()
-    session["user_id"] = user["id"]
-
-    return jsonify(
-        success=True,
-        user={
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "paid": bool(user["paid"])
-        }
-    )
-
-
-# ==================================================
-# ME
-# ==================================================
-
-@app.route("/me")
+@app.get("/api/me")
 def me():
+    u=current_user()
+    if not u:return jsonify(logged_in=False)
+    return jsonify(logged_in=True,user={"name":u["name"],"email":u["email"],"paid":bool(u["paid"])})
 
-    user = get_current_user()
+@app.get("/api/logout")
+def logout():session.clear();return jsonify(success=True,message="Logout successful")
 
-    if not user:
-        return jsonify(
-            logged_in=False
-        )
+@app.get("/api/law/<int:number>")
+@login_required
+def law(number):
+    if number not in LAWS:return jsonify(success=False,message="Law পাওয়া যায়নি"),404
+    u=current_user()
+    if number>=6 and not u["paid"]:return jsonify(success=False,message="Premium required"),403
+    return jsonify(success=True,law=LAWS[number])
 
-    return jsonify(
-        logged_in=True,
-        user={
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "paid": bool(user["paid"])
-        }
-    )
-
-
-# ==================================================
-# LOGOUT
-# ==================================================
-
-@app.route("/logout")
-def logout():
-
-    session.clear()
-
-    return jsonify(
-        success=True
-    )
-
-
-# ==================================================
-# CREATE RAZORPAY ORDER
-# ==================================================
-
-@app.route(
-    "/create-razorpay-order",
-    methods=["POST"]
-)
-def create_razorpay_order():
-
-    user = get_current_user()
-
-    if not user:
-        return jsonify(
-            success=False,
-            message="Login required"
-        ), 401
-
-    if user["paid"]:
-
-        return jsonify(
-            success=False,
-            message="Premium already active"
-        ), 400
-
-    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-
-        return jsonify(
-            success=False,
-            message="Razorpay keys configure nahi kiye gaye."
-        ), 503
-
+@app.post("/api/create-order")
+@login_required
+def create_order():
+    u=current_user()
+    if u["paid"]:return jsonify(success=False,message="Premium already active"),400
+    if not RP_ID or not RP_SECRET:return jsonify(success=False,message="Razorpay Test Keys configure nahi kiye gaye."),503
     try:
+        o=rp("POST","/orders",{"amount":PRICE,"currency":"INR",
+          "receipt":f"premium_{u['id']}_{os.urandom(5).hex()}",
+          "notes":{"user_id":str(u["id"]),"plan":"premium_lifetime"},"capture":"automatic"})
+        c=db();c.execute("INSERT INTO orders(user_id,razorpay_order_id,amount,currency) VALUES(?,?,?,?)",
+                         (u["id"],o["id"],o["amount"],o["currency"]));c.commit();c.close()
+        return jsonify(success=True,key_id=RP_ID,order_id=o["id"],amount=o["amount"],currency=o["currency"],
+                       user={"name":u["name"],"email":u["email"]})
+    except Exception as e:
+        app.logger.error("order error: %s",e);return jsonify(success=False,message="Razorpay order create nahi hua."),502
 
-        order = razorpay_request(
-            "POST",
-            "/orders",
-            {
-                "amount": PRICE,
-                "currency": "INR",
-                "receipt": (
-                    f"premium_{user['id']}_"
-                    f"{os.urandom(5).hex()}"
-                ),
-                "notes": {
-                    "user_id": str(user["id"]),
-                    "plan": "premium_lifetime"
-                }
-            }
-        )
-
-        conn = db()
-
-        conn.execute(
-            """
-            INSERT INTO orders
-            (
-                user_id,
-                razorpay_order_id,
-                amount,
-                currency,
-                status
-            )
-            VALUES (?, ?, ?, ?, 'created')
-            """,
-            (
-                user["id"],
-                order["id"],
-                order["amount"],
-                order["currency"]
-            )
-        )
-
-        conn.commit()
-        conn.close()
-
-        return jsonify(
-            success=True,
-            razorpay_key=RAZORPAY_KEY_ID,
-            order_id=order["id"],
-            amount=order["amount"],
-            currency=order["currency"]
-        )
-
-    except Exception as error:
-
-        app.logger.error(
-            "Razorpay order error: %s",
-            error
-        )
-
-        return jsonify(
-            success=False,
-            message="Razorpay order create nahi hua."
-        ), 502
-
-
-# ==================================================
-# VERIFY PAYMENT
-# ==================================================
-
-@app.route(
-    "/verify-payment",
-    methods=["POST"]
-)
+@app.post("/api/verify-payment")
+@login_required
 def verify_payment():
+    d=request.get_json(silent=True) or {};pid=str(d.get("razorpay_payment_id",""))
+    oid=str(d.get("razorpay_order_id",""));sig=str(d.get("razorpay_signature",""))
+    if not pid or not oid or not sig:return jsonify(success=False,message="Payment response incomplete hai."),400
+    u=current_user();c=db();o=c.execute("SELECT * FROM orders WHERE razorpay_order_id=? AND user_id=?",(oid,u["id"])).fetchone()
+    if not o:c.close();return jsonify(success=False,message="Order verify nahi hua."),400
+    if o["razorpay_payment_id"]:c.close();return jsonify(success=False,message="Payment already processed."),409
+    expected=hmac.new(RP_SECRET.encode(),f"{oid}|{pid}".encode(),hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected,sig):c.close();return jsonify(success=False,message="Payment signature invalid hai."),400
+    try:p=rp("GET",f"/payments/{pid}")
+    except Exception as e:
+        c.close();app.logger.error("status error: %s",e)
+        return jsonify(success=False,message="Payment status verify nahi hua."),502
+    if p.get("order_id")!=oid or p.get("status")!="captured":
+        c.close();return jsonify(success=False,message="Payment abhi captured nahi hua."),400
+    c.execute("UPDATE orders SET status='paid',razorpay_payment_id=?,razorpay_signature=? WHERE id=?",(pid,sig,o["id"]))
+    c.execute("UPDATE users SET paid=1 WHERE id=?",(u["id"],));c.commit();c.close()
+    return jsonify(success=True,message="🎉 Premium activated!",user={"name":u["name"],"email":u["email"],"paid":True})
 
-    user = get_current_user()
+@app.post("/api/razorpay/webhook")
+def webhook():
+    if not WEBHOOK_SECRET:return "",200
+    raw=request.get_data();received=request.headers.get("X-Razorpay-Signature","")
+    expected=hmac.new(WEBHOOK_SECRET.encode(),raw,hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected,received):return "invalid signature",400
+    d=request.get_json(silent=True) or {}
+    if d.get("event")=="payment.captured":
+        e=d.get("payload",{}).get("payment",{}).get("entity",{})
+        pid,oid=e.get("id"),e.get("order_id")
+        if pid and oid:
+            c=db();o=c.execute("SELECT * FROM orders WHERE razorpay_order_id=?",(oid,)).fetchone()
+            if o and not o["razorpay_payment_id"]:
+                c.execute("UPDATE orders SET status='paid',razorpay_payment_id=? WHERE id=?",(pid,o["id"]))
+                c.execute("UPDATE users SET paid=1 WHERE id=?",(o["user_id"],));c.commit()
+            c.close()
+    return "",200
 
-    if not user:
-        return jsonify(
-            success=False,
-            message="Login required"
-        ), 401
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    payment_id = str(
-        data.get(
-            "razorpay_payment_id",
-            ""
-        )
-    )
-
-    order_id = str(
-        data.get(
-            "razorpay_order_id",
-            ""
-        )
-    )
-
-    signature = str(
-        data.get(
-            "razorpay_signature",
-            ""
-        )
-    )
-
-    if not payment_id or not order_id or not signature:
-
-        return jsonify(
-            success=False,
-            message="Payment response incomplete hai."
-        ), 400
-
-    conn = db()
-
-    order = conn.execute(
-        """
-        SELECT *
-        FROM orders
-        WHERE razorpay_order_id = ?
-        AND user_id = ?
-        """,
-        (
-            order_id,
-            user["id"]
-        )
-    ).fetchone()
-
-    if not order:
-
-        conn.close()
-
-        return jsonify(
-            success=False,
-            message="Order verify nahi hua."
-        ), 400
-
-    if order["razorpay_payment_id"]:
-
-        conn.close()
-
-        return jsonify(
-            success=False,
-            message="Payment already processed."
-        ), 409
-
-    # Signature verification
-    expected_signature = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(),
-        f"{order_id}|{payment_id}".encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    if not hmac.compare_digest(
-        expected_signature,
-        signature
-    ):
-
-        conn.close()
-
-        return jsonify(
-            success=False,
-            message="Payment signature invalid hai."
-        ), 400
-
-    # Razorpay se payment status verify
-    try:
-
-        payment = razorpay_request(
-            "GET",
-            f"/payments/{payment_id}"
-        )
-
-    except Exception as error:
-
-        conn.close()
-
-        app.logger.error(
-            "Payment status error: %s",
-            error
-        )
-
-        return jsonify(
-            success=False,
-            message="Payment status verify nahi hua."
-        ), 502
-
-    if payment.get("order_id") != order_id:
-
-        conn.close()
-
-        return jsonify(
-            success=False,
-            message="Payment order mismatch."
-        ), 400
-
-    if payment.get("status") != "captured":
-
-        conn.close()
-
-        return jsonify(
-            success=False,
-            message="Payment abhi captured nahi hua."
-        ), 400
-
-    # PAYMENT SUCCESS
-    conn.execute(
-        """
-        UPDATE orders
-        SET
-            status = 'paid',
-            razorpay_payment_id = ?,
-            razorpay_signature = ?
-        WHERE id = ?
-        """,
-        (
-            payment_id,
-            signature,
-            order["id"]
-        )
-    )
-
-    conn.execute(
-        """
-        UPDATE users
-        SET paid = 1
-        WHERE id = ?
-        """,
-        (
-            user["id"],
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify(
-        success=True,
-        message="🎉 Premium activated!",
-        user={
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "paid": True
-        }
-    )
-
-
-# ==================================================
-# START SERVER
-# ==================================================
-
-if __name__ == "__main__":
-
-    init_db()
-
-    print("🚀 Server: http://127.0.0.1:5000")
-    print(
-        "💰 Premium Price:",
-        PRICE,
-        "paise"
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "5000")),
-        debug=False
-    )
+if __name__=="__main__":
+    init_db();print("🚀 http://127.0.0.1:5000")
+    app.run(host="127.0.0.1",port=5000,debug=False)

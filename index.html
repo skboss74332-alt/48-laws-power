@@ -1816,7 +1816,7 @@ async function registerUser(){
 
         const response =
             await fetch(
-                "/register",
+                "/api/register",
                 {
                     method:"POST",
 
@@ -1912,7 +1912,7 @@ async function loginUser(){
 
         const response =
             await fetch(
-                "/login",
+                "/api/login",
                 {
                     method:"POST",
 
@@ -2057,7 +2057,7 @@ async function checkLogin(){
     try{
 
         const response =
-            await fetch("/me");
+            await fetch("/api/me");
 
         const data =
             await response.json();
@@ -2093,7 +2093,7 @@ async function logoutUser(){
 
     try{
 
-        await fetch("/logout");
+        await fetch("/api/logout");
 
         document.getElementById(
             "profilePanel"
@@ -2162,7 +2162,7 @@ async function payWithRazorpay() {
 
     try {
         // Step 1: Backend se Order create karayein
-        const res = await fetch('/create-razorpay-order', {
+        const res = await fetch('/api/create-order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
         });
@@ -2184,7 +2184,7 @@ async function payWithRazorpay() {
             "order_id": orderData.order_id, // Backend se mila order id
             "handler": async function (response) {
                 // Step 3: Payment Verify Karein
-                const verifyRes = await fetch('/verify-payment', {
+                const verifyRes = await fetch('/api/verify-payment', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
